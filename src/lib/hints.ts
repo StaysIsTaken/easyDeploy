@@ -110,6 +110,25 @@ const RULES: Rule[] = [
     hint: () => ({ title: "Port ist belegt", text: "Ein anderes Programm nutzt den Port bereits. Beende es oder ändere den Port." }),
   },
   {
+    re: /Cannot find module @?(@rollup\/rollup-[\w-]+|@esbuild\/[\w-]+|@swc\/core-[\w-]+|lightningcss-[\w-]+)|npm has a bug related to optional dependencies/,
+    hint: () => ({
+      title: "node_modules ist unvollständig",
+      text: "Eine plattformspezifische Datei fehlt. Das passiert oft, wenn der Ordner node_modules von einem anderen Rechner mitkopiert wurde (z. B. per ZIP oder Teams). Lösche node_modules und installiere neu.",
+      action: {
+        label: "node_modules neu installieren",
+        command: `node -e "require('fs').rmSync('node_modules',{recursive:true,force:true})" && npm install`,
+      },
+    }),
+  },
+  {
+    re: /allow-scripts[^\n]*not yet covered by allowScripts/,
+    hint: () => ({
+      title: "npm hat Install-Skripte blockiert",
+      text: "Neuere npm-Versionen führen Install-Skripte erst nach deiner Freigabe aus. Fehlen deshalb native Module (z. B. „Could not locate the bindings file“), prüfe die Liste und gib nur Pakete frei, denen du vertraust: npm install-scripts approve <paket>.",
+      action: { label: "Blockierte Skripte anzeigen", command: "npm install-scripts ls" },
+    }),
+  },
+  {
     re: /(?:^|\n)[^\n]*?(?:bash: |sh: |zsh: )?(?:line \d+: )?([\w.-]+): (?:command )?not found/,
     hint: (m) => ({
       title: `„${m[1]}“ ist nicht installiert`,
