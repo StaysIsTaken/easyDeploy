@@ -4,7 +4,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::env_path::which;
+use crate::env_path::{current_path, which};
 
 pub struct Output {
     pub ok: bool,
@@ -17,8 +17,8 @@ pub fn command(program: &str) -> Command {
     let resolved = which(program)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| program.to_string());
-    #[allow(unused_mut)]
     let mut cmd = Command::new(resolved);
+    cmd.env("PATH", current_path());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

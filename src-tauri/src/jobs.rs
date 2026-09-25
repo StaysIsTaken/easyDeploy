@@ -15,7 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::env_path::which;
+use crate::env_path::{current_path, which};
 use crate::{github, secrets, share};
 
 // ---------------------------------------------------------------------------
@@ -505,6 +505,8 @@ fn copy_recursive(src: &Path, dst: &Path, count: &mut usize) -> std::io::Result<
 // ---------------------------------------------------------------------------
 
 fn with_term(mut cmd: CommandBuilder) -> CommandBuilder {
+    // Picks up tools found after startup (see env_path::refresh/locate).
+    cmd.env("PATH", current_path());
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd
@@ -543,10 +545,11 @@ fn shell_command(line: &str, cwd: &Path, env: &HashMap<String, String>) -> Resul
         return Err(format!("Arbeitsordner existiert nicht: {}", cwd.display()));
     }
     cmd.cwd(cwd);
+    let mut cmd = with_term(cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    Ok(with_term(cmd))
+    Ok(cmd)
 }
 
 /// Quotes a value for the local shell. On Unix single quotes disable every

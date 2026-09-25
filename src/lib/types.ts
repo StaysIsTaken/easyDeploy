@@ -116,6 +116,8 @@ export interface ToolStatus {
   name: string;
   installed: boolean;
   version?: string | null;
+  /** Where the executable was found. */
+  path?: string | null;
   ok: boolean;
   required?: string | null;
   requiredSource?: string | null;

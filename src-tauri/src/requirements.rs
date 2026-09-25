@@ -8,7 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::env_path::{android_sdk_candidates, which};
+use crate::env_path::{self, android_sdk_candidates, which};
 use crate::proc;
 
 #[derive(Serialize, Clone, Debug)]
@@ -32,6 +32,8 @@ pub struct ToolStatus {
     pub name: String,
     pub installed: bool,
     pub version: Option<String>,
+    /// Where the executable was found.
+    pub path: Option<String>,
     pub ok: bool,
     pub required: Option<String>,
     pub required_source: Option<String>,
@@ -329,17 +331,34 @@ pub fn satisfies(version: &str, constraint: &str, mode: &str) -> Option<bool> {
 // Checks
 // ---------------------------------------------------------------------------
 
-fn run_version(tool: &Tool) -> (bool, Option<String>) {
-    let Some(out) = proc::run(tool.program, tool.args, Duration::from_secs(25)) else {
-        return (false, None);
+struct Probe {
+    installed: bool,
+    version: Option<String>,
+    path: Option<PathBuf>,
+    /// Output of a version command that failed without printing a version.
+    error: Option<String>,
+}
+
+fn run_version(tool: &Tool) -> Probe {
+    let mut p = Probe { installed: false, version: None, path: None, error: None };
+    // Also looks outside the PATH (nvm, fnm, Homebrew kegs, …).
+    let Some(exe) = env_path::locate(tool.program) else {
+        return p;
+    };
+    let Some(out) = proc::run(&exe.to_string_lossy(), tool.args, Duration::from_secs(25)) else {
+        return p;
     };
     let re = Regex::new(tool.version_re).unwrap();
-    let version = re.captures(&out.text).map(|c| c[1].to_string());
-    // Windows ships a "python" stub that only opens the Store.
-    if tool.id == "python" && version.is_none() {
-        return (false, None);
+    p.version = re.captures(&out.text).map(|c| c[1].to_string());
+    p.path = Some(exe);
+    // Windows ships a "python" stub that only opens the Store; macOS has a
+    // "java" stub without a JDK; rustup without a default toolchain fails.
+    if p.version.is_none() && (!out.ok || tool.id == "python") {
+        p.error = out.text.lines().map(str::trim).find(|l| !l.is_empty()).map(String::from);
+        return p;
     }
-    (true, version)
+    p.installed = true;
+    p
 }
 
 fn android_home() -> Option<PathBuf> {
@@ -354,6 +373,7 @@ fn base_status(id: &str, name: &str) -> ToolStatus {
         name: name.into(),
         installed: false,
         version: None,
+        path: None,
         ok: false,
         required: None,
         required_source: None,
@@ -529,14 +549,23 @@ fn check_one(id: &str, constraints: &[ConstraintIn]) -> Option<ToolStatus> {
     }
     let mut s = base_status(tool.id, tool.name);
     s.docs_url = Some(tool.docs.into());
-    let (installed, version) = run_version(&tool);
-    s.installed = installed;
+    let probe = run_version(&tool);
+    let version = probe.version.clone();
+    s.installed = probe.installed;
     s.version = version.clone();
-    s.ok = installed;
+    s.path = probe.path.as_ref().map(|p| p.to_string_lossy().to_string());
+    s.ok = probe.installed;
 
-    if !installed {
-        s.message = Some(format!("{} wurde nicht gefunden.", tool.name));
-        if tool.id == "xcode" {
+    if !probe.installed {
+        s.message = Some(match (&probe.path, &probe.error) {
+            (Some(p), Some(e)) => format!("{} wurde unter {} gefunden, funktioniert aber nicht: {e}", tool.name, p.display()),
+            (Some(p), None) => format!("{} wurde unter {} gefunden, funktioniert aber nicht.", tool.name, p.display()),
+            _ => format!("{} wurde nicht gefunden.", tool.name),
+        });
+        if tool.id == "rust" && which("rustup").is_some() {
+            s.message = Some("rustup ist installiert, aber es ist keine Rust-Toolchain als Standard eingerichtet.".into());
+            s.actions.push(cmd_action("Stabile Toolchain einrichten", "rustup default stable".into(), false));
+        } else if tool.id == "xcode" {
             s.actions.push(url_action("Xcode im App Store öffnen", "macappstore://apps.apple.com/app/id497799835"));
         } else if let Some(a) = install_action(tool.name, &tool.pkg) {
             if os == "macos" && a.command.as_deref().is_some_and(|c| c.starts_with("brew ")) && which("brew").is_none() {
@@ -574,6 +603,8 @@ fn check_one(id: &str, constraints: &[ConstraintIn]) -> Option<ToolStatus> {
 #[tauri::command]
 pub async fn check_tools(ids: Vec<String>, constraints: Vec<ConstraintIn>) -> Result<Vec<ToolStatus>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Picks up tools installed since the last check (also outside the app).
+        env_path::refresh();
         let handles: Vec<_> = ids
             .into_iter()
             .map(|id| {

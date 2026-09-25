@@ -1,6 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { AlertTriangle, CheckCircle2, Download, ExternalLink, RefreshCw, XCircle } from "lucide-react";
 import { useState } from "react";
+import { api } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import type { ToolAction, ToolStatus } from "../lib/types";
 import { Button, Modal, Spinner } from "./ui";
@@ -20,24 +21,55 @@ export function RequirementsList({
   compact?: boolean;
 }) {
   const { run } = useJobs();
-  const [confirm, setConfirm] = useState<ToolAction | null>(null);
+  const [confirm, setConfirm] = useState<{ action: ToolAction; tool: ToolStatus } | null>(null);
+  const [notice, setNotice] = useState("");
 
-  const execute = async (a: ToolAction) => {
+  /** Checks a single tool again (the backend also re-reads the PATH). */
+  const recheckTool = async (id: string) => {
+    try {
+      return (await api.checkTools([id], [])).find((x) => x.id === id);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const execute = async (a: ToolAction, tool: ToolStatus) => {
     if (a.url) {
       await openUrl(a.url);
       return;
     }
     if (!a.command) return;
-    await run({
+    setNotice("");
+    // Installed outside the app since the last check? Then don't run an
+    // installer that would only fail with "already installed".
+    const missing = !tool.installed;
+    if (missing) {
+      const now = await recheckTool(tool.id);
+      if (now?.installed) {
+        setNotice(`${tool.name} ist bereits installiert${now.path ? ` (${now.path})` : ""} – Installation übersprungen.`);
+        onRecheck();
+        return;
+      }
+    }
+    const { success } = await run({
       title: a.label,
       kind: "install",
       baseDir: a.inProject ? projectDir : undefined,
       steps: [{ kind: "shell", name: a.label, command: a.command }],
     });
+    if (!success && missing) {
+      const now = await recheckTool(tool.id);
+      if (now?.installed) {
+        setNotice(
+          `Die Installation meldete einen Fehler, aber ${tool.name} ist vorhanden${now.path ? ` (${now.path})` : ""} – vermutlich war es schon installiert.`,
+        );
+      }
+    }
     onRecheck();
   };
 
-  const trigger = (a: ToolAction) => (a.confirm ? setConfirm(a) : execute(a));
+  const trigger = (action: ToolAction, tool: ToolStatus) =>
+    action.confirm ? setConfirm({ action, tool }) : execute(action, tool);
 
   if (!statuses && loading) return <Spinner label="Prüfe installierte Tools …" />;
   if (!statuses) return null;
@@ -59,7 +91,11 @@ export function RequirementsList({
           <div className="req-main">
             <div className="row gap wrap">
               <strong>{s.name}</strong>
-              {s.version && <span className="mono small muted">{s.version}</span>}
+              {s.version && (
+                <span className="mono small muted" title={s.path ?? undefined}>
+                  {s.version}
+                </span>
+              )}
               {s.required && (
                 <span className="small muted">
                   benötigt <span className="mono">{s.required}</span>
@@ -77,7 +113,7 @@ export function RequirementsList({
                   size="sm"
                   variant={i === 0 && !a.url ? "primary" : "secondary"}
                   icon={a.url ? <ExternalLink size={14} /> : <Download size={14} />}
-                  onClick={() => trigger(a)}
+                  onClick={() => trigger(a, s)}
                   title={a.command ?? a.url ?? undefined}
                 >
                   {a.label}
@@ -87,6 +123,7 @@ export function RequirementsList({
           )}
         </div>
       ))}
+      {notice && <div className="note note-ok small">{notice}</div>}
       <div className="row gap">
         <Button size="sm" variant="ghost" icon={<RefreshCw size={14} />} loading={loading} onClick={onRecheck}>
           Erneut prüfen
@@ -102,9 +139,9 @@ export function RequirementsList({
               <Button
                 variant="primary"
                 onClick={() => {
-                  const a = confirm;
+                  const c = confirm;
                   setConfirm(null);
-                  execute(a);
+                  execute(c.action, c.tool);
                 }}
               >
                 Akzeptieren & ausführen
@@ -112,9 +149,9 @@ export function RequirementsList({
             </>
           }
         >
-          <p>{confirm.confirm}</p>
+          <p>{confirm.action.confirm}</p>
           <p className="small muted">
-            Befehl: <span className="mono">{confirm.command}</span>
+            Befehl: <span className="mono">{confirm.action.command}</span>
           </p>
         </Modal>
       )}
