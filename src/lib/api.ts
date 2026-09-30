@@ -5,6 +5,7 @@ import type {
   GhRun,
   GhUser,
   GhWorkflow,
+  MacPermissionReport,
   ProjectInfo,
   ShareInfo,
   StepSpec,
@@ -20,6 +21,8 @@ export const api = {
   writeTextFile: (path: string, content: string) => invoke<void>("write_text_file", { path, content }),
 
   detectProject: (path: string) => invoke<ProjectInfo>("detect_project", { path }),
+  checkMacPermissions: (path: string) => invoke<MacPermissionReport>("check_mac_permissions", { path }),
+  fixMacPermissions: (path: string, permissions: string[]) => invoke<string[]>("fix_mac_permissions", { path, permissions }),
   listDevices: (includeNetwork: boolean) => invoke<Device[]>("list_devices", { includeNetwork }),
   checkTools: (ids: string[], constraints: VersionConstraint[]) =>
     invoke<ToolStatus[]>("check_tools", { ids, constraints }),

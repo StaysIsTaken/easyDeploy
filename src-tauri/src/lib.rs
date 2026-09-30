@@ -4,6 +4,7 @@ mod devices;
 mod env_path;
 mod github;
 mod jobs;
+mod macperms;
 mod proc;
 mod requirements;
 mod secrets;
@@ -26,6 +27,8 @@ pub fn run() {
             devices::list_devices,
             requirements::check_tools,
             requirements::system_info,
+            macperms::check_mac_permissions,
+            macperms::fix_mac_permissions,
             jobs::job_start,
             jobs::job_input,
             jobs::job_resize,

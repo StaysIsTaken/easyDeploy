@@ -111,6 +111,25 @@ export interface ToolAction {
   inProject: boolean;
 }
 
+export interface MacPermissionIssue {
+  id: "microphone" | "camera" | string;
+  label: string;
+  /** Source file that uses the device. */
+  usedIn: string;
+  missingEntitlement: boolean;
+  missingUsageDescription: boolean;
+}
+
+export interface MacPermissionReport {
+  applies: boolean;
+  issues: MacPermissionIssue[];
+  fixable: boolean;
+  configFile?: string | null;
+  manual?: string | null;
+  appId?: string | null;
+  verified: boolean;
+}
+
 export interface ToolStatus {
   id: string;
   name: string;

@@ -4,7 +4,8 @@ import { api, errorText } from "../lib/api";
 import { missingVars, resolveSteps } from "../lib/deploy";
 import { useJobs } from "../lib/jobs";
 import { useStore } from "../lib/store";
-import type { Profile, Project, Target, ToolStatus } from "../lib/types";
+import type { MacPermissionReport, Profile, Project, Target, ToolStatus } from "../lib/types";
+import { MacPermissionsNote, usesElectronBuilder } from "./MacPermissions";
 import { RequirementsList } from "./RequirementsList";
 import { Button, ErrorNote, Modal, Spinner } from "./ui";
 
@@ -16,10 +17,19 @@ interface Preflight {
   tools: ToolStatus[] | null;
   deviceIssue: string | null;
   missing: string[];
+  mac: MacPermissionReport | null;
   error: string;
 }
 
 const Ctx = createContext<{ deploy: (profileId: string) => void } | null>(null);
+
+/** Signed macOS installers of Electron apps: are microphone/camera covered? */
+async function checkMac(profile: Profile, project: Project): Promise<MacPermissionReport | null> {
+  if (profile.kind !== "node" || !usesElectronBuilder(project)) return null;
+  if (!profile.steps.some((s) => s.kind === "collect")) return null;
+  const r = await api.checkMacPermissions(project.path).catch(() => null);
+  return r?.applies && r.issues.length > 0 ? r : null;
+}
 
 async function checkDevice(target: Target): Promise<string | null> {
   if (target.kind !== "android" && target.kind !== "ios") return null;
@@ -46,7 +56,7 @@ export function DeployProvider({ children }: { children: ReactNode }) {
       try {
         steps = resolveSteps(profile, project, target);
       } catch (e) {
-        setPf({ profile, project, target, checking: false, tools: null, deviceIssue: null, missing: [], error: errorText(e) });
+        setPf({ profile, project, target, checking: false, tools: null, deviceIssue: null, missing: [], mac: null, error: errorText(e) });
         return;
       }
       const r = await run({ title: `${project.name} → ${target.name}`, kind: "deploy", profileId: profile.id, baseDir: project.path, steps });
@@ -58,17 +68,21 @@ export function DeployProvider({ children }: { children: ReactNode }) {
   const check = useCallback(
     async (profile: Profile, project: Project, target: Target, autoStart: boolean) => {
       const missing = missingVars(profile, project, target);
-      setPf({ profile, project, target, checking: true, tools: null, deviceIssue: null, missing, error: "" });
+      setPf({ profile, project, target, checking: true, tools: null, deviceIssue: null, missing, mac: null, error: "" });
       try {
-        const [tools, deviceIssue] = await Promise.all([api.checkTools(profile.tools, project.constraints), checkDevice(target)]);
-        const blocking = tools.some((t) => !t.ok && !t.optional) || !!deviceIssue || missing.length > 0;
+        const [tools, deviceIssue, mac] = await Promise.all([
+          api.checkTools(profile.tools, project.constraints),
+          checkDevice(target),
+          checkMac(profile, project),
+        ]);
+        const blocking = tools.some((t) => !t.ok && !t.optional) || !!deviceIssue || missing.length > 0 || !!mac;
         if (!blocking && autoStart) {
           start(profile, project, target);
           return;
         }
-        setPf({ profile, project, target, checking: false, tools, deviceIssue, missing, error: "" });
+        setPf({ profile, project, target, checking: false, tools, deviceIssue, missing, mac, error: "" });
       } catch (e) {
-        setPf({ profile, project, target, checking: false, tools: null, deviceIssue: null, missing, error: errorText(e) });
+        setPf({ profile, project, target, checking: false, tools: null, deviceIssue: null, missing, mac: null, error: errorText(e) });
       }
     },
     [start],
@@ -130,6 +144,7 @@ export function DeployProvider({ children }: { children: ReactNode }) {
                   Nicht gesetzte Variablen: {pf.missing.map((m) => `{{${m}}}`).join(", ")} – bitte im Profil unter „Bearbeiten“ ergänzen.
                 </div>
               )}
+              {pf.mac && <MacPermissionsNote project={pf.project} initial={pf.mac} />}
               {problems.length > 0 && (
                 <>
                   <p>Für dieses Deploy fehlt noch etwas. Du kannst es direkt hier installieren:</p>
@@ -140,7 +155,7 @@ export function DeployProvider({ children }: { children: ReactNode }) {
                   />
                 </>
               )}
-              {problems.length === 0 && !pf.deviceIssue && pf.missing.length === 0 && !pf.error && <p>Alles bereit.</p>}
+              {problems.length === 0 && !pf.deviceIssue && pf.missing.length === 0 && !pf.mac && !pf.error && <p>Alles bereit.</p>}
             </div>
           )}
         </Modal>

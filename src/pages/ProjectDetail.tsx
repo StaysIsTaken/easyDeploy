@@ -4,6 +4,7 @@ import { ArrowLeft, FileCode2, FolderOpen, Pencil, Plus, RefreshCw, Rocket, Tras
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDeploy } from "../components/DeployFlow";
 import { GithubIcon, KindIcon, TargetIcon } from "../components/icons";
+import { MacPermissionsNote, usesElectronBuilder } from "../components/MacPermissions";
 import { ProfileEditor } from "../components/ProfileEditor";
 import { ProfileWizard } from "../components/ProfileWizard";
 import { RequirementsList } from "../components/RequirementsList";
@@ -232,6 +233,7 @@ export function ProjectDetail({ id }: { id: string }) {
         </div>
       </header>
       <ErrorNote>{error}</ErrorNote>
+      {usesElectronBuilder(project) && <MacPermissionsNote key={project.path} project={project} />}
 
       <section>
         <div className="section-head">
