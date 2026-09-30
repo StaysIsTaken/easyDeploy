@@ -61,6 +61,8 @@ export function resolveSteps(profile: Profile, project: Project, target: Target)
         return { kind: "remote", name: s.name, command: f(s.command), ssh: sshConn(target) };
       case "copy":
         return { kind: "copy", name: s.name, source: f(s.source), dest: f(s.dest) };
+      case "collect":
+        return { kind: "collect", name: s.name, source: f(s.source), dest: f(s.dest) };
       case "share":
         return { kind: "share", name: s.name, source: f(s.source), title: `${project.name} · ${profile.name}` };
       case "open":

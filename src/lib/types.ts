@@ -53,7 +53,7 @@ export interface Target {
   github?: { owner: string; repo: string; workflow: string; ref: string };
 }
 
-export type StepKind = "shell" | "upload" | "remote" | "copy" | "share" | "open" | "ghDispatch";
+export type StepKind = "shell" | "upload" | "remote" | "copy" | "collect" | "share" | "open" | "ghDispatch";
 
 export interface Step {
   id: string;
@@ -194,6 +194,7 @@ export type StepSpec =
   | { kind: "upload"; name: string; source: string; remotePath: string; ssh: SshConn; excludes?: string[]; clean?: boolean }
   | { kind: "remote"; name: string; command: string; ssh: SshConn }
   | { kind: "copy"; name: string; source: string; dest: string }
+  | { kind: "collect"; name: string; source: string; dest: string }
   | { kind: "share"; name: string; source: string; title?: string }
   | { kind: "open"; name: string; target: string }
   | { kind: "gitClone"; name: string; url: string; dest: string }

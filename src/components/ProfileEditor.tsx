@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronUp, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { buildRecipe, TARGETS_FOR, VAR_LABEL } from "../lib/recipes";
+import { buildRecipe, INSTALLER_DIR, TARGETS_FOR, VAR_LABEL } from "../lib/recipes";
 import { useStore } from "../lib/store";
 import type { Profile, Step, StepKind } from "../lib/types";
 import { uid } from "../lib/util";
@@ -11,6 +11,7 @@ export const STEP_KIND_LABEL: Record<StepKind, string> = {
   upload: "Hochladen (SSH)",
   remote: "Befehl auf Server",
   copy: "Kopieren",
+  collect: "Installer einsammeln",
   share: "Im Netzwerk teilen",
   open: "Öffnen",
   ghDispatch: "GitHub-Workflow",
@@ -25,6 +26,7 @@ function stepDetail(s: Step): string {
     case "upload":
       return `${s.source} → ${s.remotePath}${s.excludes?.length ? `  (ohne ${s.excludes.join(", ")})` : ""}`;
     case "copy":
+    case "collect":
       return `${s.source} → ${s.dest}`;
     case "share":
       return s.source ?? "";
@@ -110,9 +112,14 @@ function StepEditor({
           </div>
         </>
       )}
-      {step.kind === "copy" && (
+      {(step.kind === "copy" || step.kind === "collect") && (
         <div className="grid-2">
-          <input className="input mono small" placeholder="Quelle" value={step.source ?? ""} onChange={(e) => set({ source: e.target.value })} />
+          <input
+            className="input mono small"
+            placeholder={step.kind === "collect" ? "Ausgabeordner des Packagers (z. B. dist)" : "Quelle"}
+            value={step.source ?? ""}
+            onChange={(e) => set({ source: e.target.value })}
+          />
           <input className="input mono small" placeholder="Ziel-Ordner" value={step.dest ?? ""} onChange={(e) => set({ dest: e.target.value })} />
         </div>
       )}
@@ -146,6 +153,7 @@ export function ProfileEditor({ profile, onClose }: { profile: Profile; onClose:
   const addStep = (kind: StepKind) => {
     const s: Step = { id: uid(), kind, name: STEP_KIND_LABEL[kind] };
     if (kind === "upload") Object.assign(s, { source: ".", remotePath: "{{remotePath}}" });
+    if (kind === "collect") Object.assign(s, { source: "dist", dest: INSTALLER_DIR });
     setP({ ...p, steps: [...p.steps, s] });
   };
 
@@ -157,7 +165,7 @@ export function ProfileEditor({ profile, onClose }: { profile: Profile; onClose:
     setP({ ...p, steps: r.steps, tools: r.tools, notes: r.notes, vars: { ...r.vars, ...p.vars } });
   };
 
-  const addable: StepKind[] = ["shell", "copy", "share", "open"];
+  const addable: StepKind[] = ["shell", "copy", "collect", "share", "open"];
   if (target?.kind === "ssh") addable.push("upload", "remote");
 
   return (

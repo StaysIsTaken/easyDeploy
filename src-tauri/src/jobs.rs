@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -65,6 +65,14 @@ pub enum StepSpec {
         source: String,
         dest: String,
     },
+    /// Gathers the installer files (dmg, exe, AppImage, …) a packager wrote
+    /// somewhere below `source` into `dest`, skipping unpacked app folders.
+    #[serde(rename_all = "camelCase")]
+    Collect {
+        name: String,
+        source: String,
+        dest: String,
+    },
     #[serde(rename_all = "camelCase")]
     Share {
         name: String,
@@ -93,6 +101,7 @@ impl StepSpec {
             | StepSpec::Upload { name, .. }
             | StepSpec::Remote { name, .. }
             | StepSpec::Copy { name, .. }
+            | StepSpec::Collect { name, .. }
             | StepSpec::Share { name, .. }
             | StepSpec::Open { name, .. }
             | StepSpec::GitClone { name, .. }
@@ -277,6 +286,7 @@ fn run_job(app: &AppHandle, handle: &Arc<JobHandle>, req: JobRequest) -> Result<
     let job_id = req.job_id.as_str();
     let base = req.base_dir.as_ref().map(PathBuf::from);
     let total = req.steps.len();
+    let started = SystemTime::now();
     emit_line(app, job_id, &format!("\x1b[1;35m◆ {}\x1b[0m", req.title));
 
     for (i, step) in req.steps.iter().enumerate() {
@@ -294,7 +304,7 @@ fn run_job(app: &AppHandle, handle: &Arc<JobHandle>, req: JobRequest) -> Result<
             &format!("\r\n\x1b[1;36m▶ Schritt {}/{}: {}\x1b[0m", i + 1, total, step.name()),
         );
 
-        let result = run_step(app, handle, job_id, &base, &req.env, step);
+        let result = run_step(app, handle, job_id, &base, &req.env, step, started);
         match result {
             Ok(true) => {
                 emit_step(app, job_id, i, "success");
@@ -329,6 +339,7 @@ fn run_step(
     base: &Option<PathBuf>,
     job_env: &Option<HashMap<String, String>>,
     step: &StepSpec,
+    started: SystemTime,
 ) -> Result<bool, String> {
     match step {
         StepSpec::Shell { command, cwd, env, allow_failure, .. } => {
@@ -426,6 +437,25 @@ fn run_step(
             emit_line(app, job_id, &format!("{count} Datei(en) kopiert nach {}", target.display()));
             Ok(true)
         }
+        StepSpec::Collect { source, dest, .. } => {
+            let src = resolve(base, source);
+            let dst = resolve(base, dest);
+            if !src.is_dir() {
+                return Err(format!("Ausgabeordner nicht gefunden: {}", src.display()));
+            }
+            let files = collect_installers(&src, &dst, started).map_err(|e| e.to_string())?;
+            if files.is_empty() {
+                return Err(format!(
+                    "In {} wurden keine Installationsdateien (.dmg, .exe, .AppImage, …) gefunden.",
+                    src.display()
+                ));
+            }
+            for f in &files {
+                emit_line(app, job_id, &format!("  {f}"));
+            }
+            emit_line(app, job_id, &format!("{} Datei(en) in {}", files.len(), dst.display()));
+            Ok(true)
+        }
         StepSpec::Share { source, title, .. } => {
             let src = resolve(base, source);
             let title = title.clone().unwrap_or_else(|| {
@@ -478,6 +508,70 @@ fn run_step(
             Ok(true)
         }
     }
+}
+
+const INSTALLER_EXTS: &[&str] = &[
+    ".dmg", ".pkg", ".zip", ".exe", ".msi", ".msix", ".appx", ".appimage", ".deb", ".rpm", ".snap", ".flatpak",
+    ".pacman", ".tar.gz", ".tar.xz", ".tar.bz2", ".7z", ".apk", ".aab",
+];
+
+fn is_installer(name: &str) -> bool {
+    let n = name.to_lowercase();
+    INSTALLER_EXTS.iter().any(|e| n.ends_with(e)) && !n.ends_with(".blockmap")
+}
+
+/// Finds installer files below `src` (preferring the ones built by this job)
+/// and copies them flat into `dst`. Returns the copied file names.
+fn collect_installers(src: &Path, dst: &Path, since: SystemTime) -> std::io::Result<Vec<String>> {
+    fn walk(dir: &Path, skip: &Path, depth: usize, out: &mut Vec<(PathBuf, SystemTime)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() || name.starts_with('.') || p == skip {
+                continue;
+            }
+            if ft.is_dir() {
+                // App bundles and unpacked builds are folders, not installers.
+                let bundle = [".app", "-unpacked", ".framework"].iter().any(|s| name.ends_with(s));
+                if depth < 6 && !bundle && name != "node_modules" {
+                    walk(&p, skip, depth + 1, out);
+                }
+            } else if is_installer(&name) {
+                let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((p, modified));
+            }
+        }
+    }
+    let mut found = vec![];
+    walk(src, dst, 0, &mut found);
+    // Output folders keep installers of older versions around – only take the
+    // ones from this run when there are any.
+    let threshold = since - Duration::from_secs(5);
+    if found.iter().any(|(_, m)| *m >= threshold) {
+        found.retain(|(_, m)| *m >= threshold);
+    }
+
+    // Only wipe our own staging folder, never a folder the user typed in.
+    if dst.components().any(|c| c.as_os_str() == ".easydeploy") && dst.is_dir() {
+        std::fs::remove_dir_all(dst)?;
+    }
+    std::fs::create_dir_all(dst)?;
+    if let Some(stage) = dst.ancestors().find(|a| a.file_name().is_some_and(|n| n == ".easydeploy")) {
+        let _ = std::fs::write(stage.join(".gitignore"), "*\n");
+    }
+    let mut names = vec![];
+    for (p, _) in found {
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if names.contains(&name) {
+            continue;
+        }
+        std::fs::copy(&p, dst.join(&name))?;
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn copy_recursive(src: &Path, dst: &Path, count: &mut usize) -> std::io::Result<()> {
@@ -920,6 +1014,27 @@ mod tests {
             Some(Detected::AutoSecret(_)) => Some("auto".into()),
             None => None,
         }
+    }
+
+    #[test]
+    fn collects_only_installers() {
+        let root = std::env::temp_dir().join(format!("ed-collect-{}", std::process::id()));
+        let dist = root.join("dist");
+        std::fs::create_dir_all(dist.join("mac-arm64").join("Demo.app").join("Contents")).unwrap();
+        std::fs::create_dir_all(dist.join("win-unpacked")).unwrap();
+        std::fs::write(dist.join("mac-arm64/Demo.app/Contents/inner.zip"), "x").unwrap();
+        std::fs::write(dist.join("win-unpacked/Demo.exe"), "x").unwrap();
+        std::fs::write(dist.join("Demo-1.0.0-arm64.dmg"), "x").unwrap();
+        std::fs::write(dist.join("Demo-1.0.0-arm64.dmg.blockmap"), "x").unwrap();
+        std::fs::write(dist.join("latest-mac.yml"), "x").unwrap();
+        let dst = root.join(".easydeploy").join("installer");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("old.dmg"), "x").unwrap();
+        let files = collect_installers(&dist, &dst, SystemTime::now()).unwrap();
+        assert_eq!(files, vec!["Demo-1.0.0-arm64.dmg".to_string()]);
+        assert!(!dst.join("old.dmg").exists());
+        assert!(root.join(".easydeploy/.gitignore").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

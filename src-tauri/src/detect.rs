@@ -177,6 +177,7 @@ pub fn detect_project(path: String) -> Result<ProjectInfo, String> {
         let is_tauri = types.iter().any(|t| t.kind == "tauri");
         let scripts: Vec<String> = p["scripts"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
         let framework = [
+            ("electron", "Electron"),
             ("next", "Next.js"),
             ("nuxt", "Nuxt"),
             ("@angular/core", "Angular"),
@@ -200,12 +201,14 @@ pub fn detect_project(path: String) -> Result<ProjectInfo, String> {
         } else {
             "dist"
         };
-        let server = deps.contains_key("express")
+        let server = !deps.contains_key("electron")
+            && (deps.contains_key("express")
             || deps.contains_key("fastify")
             || deps.contains_key("@nestjs/core")
             || deps.contains_key("next")
-            || deps.contains_key("nuxt");
+            || deps.contains_key("nuxt"));
         let mut d = HashMap::new();
+        d.extend(installer_info(&root, p, &deps, std::env::consts::OS));
         d.insert("packageManager".into(), package_manager(&root).into());
         d.insert("scripts".into(), scripts.join(","));
         d.insert("outputDir".into(), output.into());
@@ -320,6 +323,185 @@ pub fn detect_project(path: String) -> Result<ProjectInfo, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Desktop installers (Electron & co.)
+// ---------------------------------------------------------------------------
+
+const MAC: &[&str] = &["mac", "macos", "osx", "darwin", "dmg"];
+const WIN: &[&str] = &["win", "windows", "win32", "win64", "exe", "nsis", "msi"];
+const LINUX: &[&str] = &["linux", "appimage", "deb", "rpm", "snap"];
+
+fn script_tokens(body: &str) -> Vec<&str> {
+    body.split(|c: char| c.is_whitespace() || "&;|\"'()".contains(c)).filter(|t| !t.is_empty()).collect()
+}
+
+/// Scripts that `name` runs via `npm run x`, `yarn x`, `pnpm x`, … (transitively).
+fn referenced_scripts<'a>(scripts: &'a HashMap<String, String>, name: &str, depth: usize, out: &mut Vec<&'a str>) {
+    let Some(body) = scripts.get(name) else { return };
+    let tokens = script_tokens(body);
+    for (i, tok) in tokens.iter().enumerate() {
+        let prev = if i > 0 { tokens[i - 1] } else { "" };
+        let runner = ["run", "yarn", "pnpm", "bun", "run-s", "run-p", "npm-run-all"].contains(&prev);
+        if let Some((key, _)) = scripts.get_key_value(*tok) {
+            if runner && key != name && !out.contains(&key.as_str()) {
+                out.push(key.as_str());
+                if depth < 5 {
+                    referenced_scripts(scripts, key, depth + 1, out);
+                }
+            }
+        }
+    }
+}
+
+/// The body of a script including everything it runs.
+fn expanded_body(scripts: &HashMap<String, String>, name: &str) -> String {
+    let mut refs = vec![];
+    referenced_scripts(scripts, name, 0, &mut refs);
+    let mut body = scripts.get(name).cloned().unwrap_or_default();
+    for r in refs {
+        body.push('\n');
+        body.push_str(&scripts[r]);
+    }
+    body
+}
+
+/// Which packager a script body uses to create installers.
+fn packager_in(body: &str) -> Option<&'static str> {
+    if body.contains("electron-builder") && !body.contains("install-app-deps") {
+        Some("electron-builder")
+    } else if body.contains("electron-forge make") || body.contains("forge make") {
+        Some("electron-forge")
+    } else if body.contains("electron-packager") || body.contains("@electron/packager") {
+        Some("electron-packager")
+    } else {
+        None
+    }
+}
+
+/// Picks the npm script that builds an installer for `os` (e.g. `dist:mac`)
+/// and where the packager writes its output.
+fn installer_info(root: &Path, pkg: &Value, deps: &HashMap<String, String>, os: &str) -> HashMap<String, String> {
+    let scripts: HashMap<String, String> = pkg["scripts"]
+        .as_object()
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
+        .unwrap_or_default();
+    let (mine, others): (&[&str], Vec<&[&str]>) = match os {
+        "macos" => (MAC, vec![WIN, LINUX]),
+        "windows" => (WIN, vec![MAC, LINUX]),
+        _ => (LINUX, vec![MAC, WIN]),
+    };
+    let flag = |w: &[&str]| format!("--{}", w[0]);
+
+    let mut best: Option<(i32, &str, &'static str)> = None;
+    for name in scripts.keys() {
+        let lower = name.to_lowercase();
+        let base = lower.trim_start_matches("pre").trim_start_matches("post");
+        // Lifecycle hooks (postinstall runs `electron-builder install-app-deps`)
+        // and anything that publishes a release are never picked.
+        if ["install", "prepare", "prepublish", "prepublishonly", "prepack", "postpack"].contains(&lower.as_str())
+            || (base != lower && scripts.contains_key(base))
+            || lower.contains("publish")
+            || lower.contains("release")
+            || lower.contains("deploy")
+        {
+            continue;
+        }
+        let body = expanded_body(&scripts, name);
+        let Some(packager) = packager_in(&body) else { continue };
+        if body.contains("--publish always") || body.contains("-p always") || body.contains("electron-forge publish") {
+            continue;
+        }
+        // `--dir` only produces the unpacked app, no installer.
+        if packager == "electron-builder" && script_tokens(&body).contains(&"--dir") {
+            continue;
+        }
+        let segments: Vec<&str> = lower.split([':', '-', '_', '.']).collect();
+        let named_mine = segments.iter().any(|s| mine.contains(s));
+        let named_other = segments.iter().any(|s| others.iter().any(|o| o.contains(s)));
+        let flags_mine = body.contains(&flag(mine));
+        let flags_other = others.iter().any(|o| body.contains(&flag(o)));
+        if (named_other && !named_mine) || (flags_other && !flags_mine && !named_mine) {
+            continue;
+        }
+        let mut score = if named_mine || flags_mine { 30 } else { 20 };
+        score += match segments[0] {
+            "dist" | "make" | "installer" => 5,
+            "package" | "pack" | "electron" => 3,
+            "build" => 1,
+            _ => 0,
+        };
+        if packager == "electron-packager" {
+            score -= 10;
+        }
+        let better = match best {
+            None => true,
+            // Shorter names win ties: `dist:mac` over `dist:mac:universal`.
+            Some((b, bn, _)) => score > b || (score == b && name.len() < bn.len()),
+        };
+        if better {
+            best = Some((score, name.as_str(), packager));
+        }
+    }
+
+    let mut d = HashMap::new();
+    let packager = best.map(|b| b.2).or_else(|| {
+        if deps.contains_key("electron-builder") {
+            Some("electron-builder")
+        } else if deps.keys().any(|k| k.starts_with("@electron-forge/")) {
+            Some("electron-forge")
+        } else if deps.contains_key("electron-packager") || deps.contains_key("@electron/packager") {
+            Some("electron-packager")
+        } else {
+            None
+        }
+    });
+    let Some(packager) = packager else { return d };
+    d.insert("packager".into(), packager.into());
+    if let Some((_, name, _)) = best {
+        d.insert("installerScript".into(), name.into());
+        let mut refs = vec![];
+        referenced_scripts(&scripts, name, 0, &mut refs);
+        let body = scripts.get(name).map(String::as_str).unwrap_or_default();
+        let builds = name == "build" || refs.contains(&"build") || body.contains("vite build") || body.contains("electron-vite build");
+        d.insert("installerRunsBuild".into(), builds.to_string());
+    }
+    let script_body = best.map(|b| expanded_body(&scripts, b.1)).unwrap_or_default();
+    let output = match packager {
+        "electron-builder" => electron_builder_output(root, pkg).unwrap_or_else(|| "dist".into()),
+        "electron-forge" => "out/make".into(),
+        _ => {
+            let tokens = script_tokens(&script_body);
+            tokens
+                .iter()
+                .enumerate()
+                .find_map(|(i, t)| {
+                    t.strip_prefix("--out=").map(String::from).or_else(|| (*t == "--out").then(|| tokens.get(i + 1).map(|s| s.to_string())).flatten())
+                })
+                .unwrap_or_else(|| ".".into())
+        }
+    };
+    d.insert("installerOutput".into(), output.trim_end_matches('/').to_string());
+    d
+}
+
+fn electron_builder_output(root: &Path, pkg: &Value) -> Option<String> {
+    if let Some(o) = pkg["build"]["directories"]["output"].as_str() {
+        return Some(o.into());
+    }
+    for f in ["electron-builder.json", "electron-builder.json5"] {
+        if let Some(o) = read_json(&root.join(f)).and_then(|v| v["directories"]["output"].as_str().map(String::from)) {
+            return Some(o);
+        }
+    }
+    for f in ["electron-builder.yml", "electron-builder.yaml"] {
+        let y = read(&root.join(f)).and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok());
+        if let Some(o) = y.and_then(|v| v["directories"]["output"].as_str().map(String::from)) {
+            return Some(o);
+        }
+    }
+    None
+}
+
 fn package_manager(root: &Path) -> &'static str {
     if root.join("pnpm-lock.yaml").is_file() {
         "pnpm"
@@ -397,6 +579,52 @@ mod tests {
         let tauri = info.types.iter().find(|t| t.kind == "tauri").expect("tauri erkannt");
         assert_eq!(tauri.details.get("packageManager").map(String::as_str), Some("npm"));
         assert_eq!(info.name, "easydeploy");
+    }
+
+    fn installer(scripts: serde_json::Value, deps: &[&str], os: &str) -> HashMap<String, String> {
+        let pkg = serde_json::json!({ "scripts": scripts });
+        let deps = deps.iter().map(|d| (d.to_string(), "1".to_string())).collect();
+        installer_info(Path::new("/nonexistent"), &pkg, &deps, os)
+    }
+
+    #[test]
+    fn picks_installer_script_for_os() {
+        let scripts = serde_json::json!({
+            "start": "electron .",
+            "build": "tsc",
+            "postinstall": "electron-builder install-app-deps",
+            "pack": "electron-builder --dir",
+            "dist": "npm run build && electron-builder",
+            "dist:mac": "npm run build && electron-builder --mac",
+            "dist:win": "npm run build && electron-builder --win",
+            "release": "electron-builder --publish always"
+        });
+        let mac = installer(scripts.clone(), &["electron", "electron-builder"], "macos");
+        assert_eq!(mac.get("installerScript").map(String::as_str), Some("dist:mac"));
+        assert_eq!(mac.get("installerRunsBuild").map(String::as_str), Some("true"));
+        assert_eq!(mac.get("installerOutput").map(String::as_str), Some("dist"));
+        let win = installer(scripts.clone(), &["electron-builder"], "windows");
+        assert_eq!(win.get("installerScript").map(String::as_str), Some("dist:win"));
+        let linux = installer(scripts, &["electron-builder"], "linux");
+        assert_eq!(linux.get("installerScript").map(String::as_str), Some("dist"));
+    }
+
+    #[test]
+    fn follows_nested_scripts_and_forge() {
+        let nested = installer(
+            serde_json::json!({ "compile": "tsc", "electron:pack": "electron-builder -m", "dist": "npm run compile && npm run electron:pack" }),
+            &[],
+            "macos",
+        );
+        assert_eq!(nested.get("installerScript").map(String::as_str), Some("dist"));
+        assert_eq!(nested.get("installerRunsBuild").map(String::as_str), Some("false"));
+        let forge = installer(serde_json::json!({ "package": "electron-forge package", "make": "electron-forge make" }), &["@electron-forge/cli"], "macos");
+        assert_eq!(forge.get("installerScript").map(String::as_str), Some("make"));
+        assert_eq!(forge.get("installerOutput").map(String::as_str), Some("out/make"));
+        let dep_only = installer(serde_json::json!({ "start": "electron ." }), &["electron-builder"], "macos");
+        assert_eq!(dep_only.get("packager").map(String::as_str), Some("electron-builder"));
+        assert!(dep_only.get("installerScript").is_none());
+        assert!(installer(serde_json::json!({ "build": "vite build" }), &["vite"], "macos").is_empty());
     }
 
     #[test]

@@ -64,6 +64,9 @@ function pmCommands(pm: string) {
 
 const desktopPlatform = (os: string) => (os === "macos" ? "macos" : os === "windows" ? "windows" : "linux");
 
+/** Staging folder for built installers (ignored by git, see jobs.rs). */
+export const INSTALLER_DIR = ".easydeploy/installer";
+
 const ANDROID_BUILD_TOOLS = ["java", "android-licenses", "android-platform"];
 const APPLE_TOOLS = ["xcode", "xcode-license"];
 
@@ -228,8 +231,45 @@ export function buildRecipe(project: Project, type: DetectedType, target: Target
       const scripts = (type.details.scripts ?? "").split(",");
       const isServer = type.details.server === "true";
       const out = type.details.outputDir ?? "dist";
+      const packager = type.details.packager;
       tools("node", pm.tool);
       add(sh("Abhängigkeiten installieren", pm.install));
+
+      // Desktop apps (Electron): build a real installer instead of starting the app.
+      if (packager && (t === "local" || t === "share" || t === "folder" || t === "ssh")) {
+        const script = type.details.installerScript;
+        const runsBuild = type.details.installerRunsBuild === "true";
+        if (scripts.includes("build") && !runsBuild && script !== "build") add(sh("Bauen", pm.run("build")));
+        const command = script
+          ? pm.run(script)
+          : packager === "electron-forge"
+            ? `${pm.exec} electron-forge make`
+            : packager === "electron-packager"
+              ? `${pm.exec} electron-packager . --out=out`
+              : `${pm.exec} electron-builder`;
+        add(sh("Installer erzeugen", command));
+        const output = type.details.installerOutput || (packager === "electron-packager" ? "out" : "dist");
+        // electron-packager only produces the app folder, no installer file.
+        let result = output;
+        if (packager !== "electron-packager") {
+          add(step("collect", "Installationsdateien einsammeln", { source: output, dest: INSTALLER_DIR }));
+          result = INSTALLER_DIR;
+        }
+        if (t === "local") add(step("open", "Installer-Ordner öffnen", { target: result }));
+        if (t === "share") add(step("share", "Installer im Netzwerk bereitstellen", { source: result }));
+        if (t === "folder") add(step("copy", "In Ordner kopieren", { source: result, dest: "{{dest}}" }));
+        if (t === "ssh") add(step("upload", "Installer hochladen", { source: result, remotePath: "{{remotePath}}" }));
+        if (os === "macos") {
+          r.notes.push(
+            "Ohne Apple-Developer-Zertifikat ist die App nicht signiert: macOS warnt beim ersten Öffnen (Rechtsklick → Öffnen hilft).",
+          );
+        } else if (os === "windows") {
+          r.notes.push("Unsignierte Installer lösen eine SmartScreen-Warnung aus („Weitere Informationen“ → „Trotzdem ausführen“).");
+        }
+        if (!script) r.notes.push(`Im package.json wurde kein Installer-Skript gefunden – es wird direkt ${packager} verwendet.`);
+        break;
+      }
+
       if (scripts.includes("build")) add(sh("Bauen", pm.run("build")));
       if (t === "ssh") {
         if (isServer) {

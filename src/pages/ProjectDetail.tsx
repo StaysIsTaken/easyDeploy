@@ -176,6 +176,15 @@ export function ProjectDetail({ id }: { id: string }) {
     // Only re-check when the set of tools changes, not on every render.
   }, [toolIds.join(",")]);
 
+  // Pick up changes in the project (new scripts, packagers, …) when it is opened.
+  useEffect(() => {
+    if (!project) return;
+    api
+      .detectProject(project.path)
+      .then((info) => updateProject(project.id, info))
+      .catch(() => {});
+  }, [project?.id]);
+
   if (!project) return <Empty icon={<FolderOpen size={32} />} title="Projekt nicht gefunden" />;
 
   const redetect = async () => {
